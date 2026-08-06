@@ -71,10 +71,23 @@ try (Scope scope = span.makeCurrent()) {
 
 `getTracer()` returns a no-op tracer if called before `Owl24.init()`, so it's always safe to call.
 
+### Database metrics
+
+Java has no agent-free way to auto-tag JDBC calls with `db.system` the way Flask/Express-style instrumentation does for HTTP, so wrap your `DataSource` explicitly with `Owl24.instrumentDataSource(...)`:
+
+```java
+import javax.sql.DataSource;
+
+DataSource tracedDataSource = Owl24.instrumentDataSource(dataSource);
+```
+
+Use `tracedDataSource` wherever you'd have used the original (e.g. register it as your Spring `DataSource` bean). Every connection/statement it hands out is then traced and reported to your dashboard's Database page as `db.query.count`, `db.query.duration_ms`, and `db.query.error_count`, grouped by DB system. Returns the original `DataSource` unwrapped if called before `Owl24.init()`.
+
 ## What it does
 
 - **Logs**: bridges `System.out`/`System.err` — every call is forwarded as a structured log, tagged with the active trace/span ID if one exists. If Logback is present, it also attaches an appender to the root logger so ordinary SLF4J/Logback calls (`logger.info(...)`, `logger.error(...)`, including the attached stack trace) are forwarded the same way — this is what makes Spring Boot's default logging show up without any extra configuration. Both bridges are controlled by the single `disableConsoleBridge` flag.
 - **Traces**: sets up an OpenTelemetry `SdkTracerProvider` exporting via OTLP/HTTP. Spans you create manually are masked and exported.
+- **Database metrics**: queries run through a `DataSource` wrapped via `Owl24.instrumentDataSource(...)` (see [Database metrics](#database-metrics)) are automatically turned into `db.query.count`/`db.query.duration_ms`/`db.query.error_count` on your dashboard's Database page.
 - **JVM runtime metrics**: CPU, memory, GC, thread, and class-loading metrics are collected and exported automatically — no setup required.
 - **Crash capture**: installs a default uncaught-exception handler so fatal errors (on any thread) are captured as a FATAL-severity log event and flushed before the process exits.
 - **PII masking**: emails, credit-card-shaped numbers, phone numbers, and bearer tokens are scrubbed from span attributes and log bodies before they ever leave your process.

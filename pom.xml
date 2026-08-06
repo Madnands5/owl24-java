@@ -4,7 +4,7 @@
 
     <groupId>dev.owl24.apm</groupId>
     <artifactId>owl24-java</artifactId>
-    <version>0.1.2</version>
+    <version>0.1.3</version>
     <packaging>jar</packaging>
 
     <name>owl24-java</name>
@@ -100,6 +100,49 @@
             <groupId>io.opentelemetry.instrumentation</groupId>
             <artifactId>opentelemetry-runtime-telemetry-java8</artifactId>
             <version>2.12.0-alpha</version>
+        </dependency>
+
+        <!--
+          Library (agent-free) JDBC instrumentation - what
+          Owl24.instrumentDataSource() wraps a DataSource with to produce
+          db.system-tagged spans for Owl24DbMetricsSpanProcessor to derive
+          db.query.* metrics from. Pinned to the same 2.12.0-alpha release
+          train as opentelemetry-runtime-telemetry-java8 above, for the same
+          reason: that's the instrumentation release verified to target this
+          SDK's OTel 1.46.0.
+        -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-jdbc</artifactId>
+            <version>2.12.0-alpha</version>
+        </dependency>
+        <!--
+          opentelemetry-jdbc:2.12.0-alpha's own POM requires
+          opentelemetry-instrumentation-api:2.12.0 (that's where
+          ServerAttributesGetter, needed by JdbcTelemetry.create(...).build(),
+          actually lives - confirmed by inspecting both artifacts' jars
+          directly; io.micrometer:micrometer-tracing-bridge-otel is a
+          same-name red herring, not the actual dependency owl24-java's
+          Owl24DbMetricsSpanProcessor/instrumentDataSource path needs). Left
+          undeclared, this is only a transitive dependency of opentelemetry-
+          jdbc - and any consumer whose own classpath pulls an older
+          instrumentation-api transitively from elsewhere (verified live:
+          Spring's micrometer-tracing-bridge-otel pulls 1.33.3, which
+          predates that class) can have Maven's nearest-wins mediation
+          downgrade it there, causing Owl24.instrumentDataSource() to fail
+          with NoClassDefFoundError at DataSource-bean construction time
+          even though `mvn compile` on owl24-java itself never notices
+          (nothing in owl24-java's own source references that class
+          directly - only opentelemetry-jdbc's internals do, at runtime).
+          Declaring it directly here - not just left to opentelemetry-jdbc's
+          transitive pull - makes owl24-java self-contained: any consumer
+          now gets a working version regardless of what else on their
+          classpath would otherwise win mediation.
+        -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-instrumentation-api</artifactId>
+            <version>2.12.0</version>
         </dependency>
 
         <!--

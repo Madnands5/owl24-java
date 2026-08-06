@@ -13,6 +13,7 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.exporter.otlp.http.logs.OtlpHttpLogRecordExporter;
 import io.opentelemetry.exporter.otlp.http.metrics.OtlpHttpMetricExporter;
 import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
+import io.opentelemetry.instrumentation.jdbc.datasource.JdbcTelemetry;
 import io.opentelemetry.instrumentation.runtimemetrics.java8.Classes;
 import io.opentelemetry.instrumentation.runtimemetrics.java8.Cpu;
 import io.opentelemetry.instrumentation.runtimemetrics.java8.GarbageCollector;
@@ -35,9 +36,15 @@ import io.opentelemetry.sdk.trace.data.StatusData;
 import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
 
+import javax.sql.DataSource;
+
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.PrintStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -180,6 +187,49 @@ public class Owl24 {
 
     private static boolean crashCaptureRegistered = false;
 
+    // Keep in sync with pom.xml's <version> on each release - no build-time
+    // manifest injection is set up to read this automatically, so unlike
+    // owl24-py's importlib.metadata-based lookup, this has to be maintained
+    // by hand here.
+    private static final String SDK_VERSION = "0.1.3";
+
+    /**
+     * Called once at the very start of init() - separate from the OTLP
+     * exporters below, since their interfaces only ever expose a
+     * {@link CompletableResultCode} (success/failure), never the underlying
+     * HTTP response, so there's no way to detect ingestor.js's 426 Upgrade
+     * Required from inside a normal export call. A short timeout and a
+     * blanket catch mean a slow/unreachable server here degrades to
+     * "assume fine, proceed" rather than delaying or breaking the host
+     * app's own startup.
+     */
+    private static boolean checkSdkVersion(String ingestBaseUrl, String apiKey, String userEmail, Duration timeout) {
+        try {
+            HttpClient client = HttpClient.newBuilder().connectTimeout(timeout).build();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(ingestBaseUrl + "/v1/sdk-check"))
+                    .header("x-api-key", apiKey)
+                    .header("x-user-email", userEmail)
+                    .header("x-sdk-language", "java")
+                    .header("x-sdk-version", SDK_VERSION)
+                    .timeout(timeout)
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            Map<?, ?> body = objectMapper.readValue(response.body(), Map.class);
+            if (Boolean.TRUE.equals(body.get("update_required"))) {
+                System.err.println("[Owl24] Please Update package. telemetry shutting down");
+                return true;
+            }
+            return false;
+        } catch (Exception e) {
+            // Unreachable/unexpected response: fail open (assume the
+            // version is fine) rather than blocking a customer's app
+            // startup on an ingest endpoint being temporarily unavailable.
+            return false;
+        }
+    }
+
     public static void init(String apiKey, String serviceName) {
         init(apiKey, serviceName, 3000, false);
     }
@@ -205,6 +255,15 @@ public class Owl24 {
 
         if (resolvedApiKey == null) {
             System.err.println("[Owl24] API Key required.");
+            return;
+        }
+
+        // Server-side version gate (ingestor.js) refuses actual telemetry
+        // ingestion from a version this far behind anyway - checking here
+        // first means a customer running a known-bad old release finds out
+        // via a clear log line at startup, instead of every export
+        // silently failing with no explanation.
+        if (checkSdkVersion(ingestBaseUrl, resolvedApiKey, userEmail, Duration.ofMillis(exportTimeoutMillis))) {
             return;
         }
 
@@ -242,6 +301,8 @@ public class Owl24 {
                     .setEndpoint(ingestBaseUrl + "/v1/traces")
                     .addHeader("x-api-key", resolvedApiKey)
                     .addHeader("x-user-email", userEmail)
+                    .addHeader("x-sdk-language", "java")
+                    .addHeader("x-sdk-version", SDK_VERSION)
                     .setTimeout(exportTimeout)
                     .build();
 
@@ -249,6 +310,8 @@ public class Owl24 {
                     .setEndpoint(ingestBaseUrl + "/v1/metrics")
                     .addHeader("x-api-key", resolvedApiKey)
                     .addHeader("x-user-email", userEmail)
+                    .addHeader("x-sdk-language", "java")
+                    .addHeader("x-sdk-version", SDK_VERSION)
                     .setTimeout(exportTimeout)
                     .build();
 
@@ -256,6 +319,8 @@ public class Owl24 {
                     .setEndpoint(ingestBaseUrl + "/v1/logs")
                     .addHeader("x-api-key", resolvedApiKey)
                     .addHeader("x-user-email", userEmail)
+                    .addHeader("x-sdk-language", "java")
+                    .addHeader("x-sdk-version", SDK_VERSION)
                     .setTimeout(exportTimeout)
                     .build();
 
@@ -279,6 +344,7 @@ public class Owl24 {
             SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
                     .setResource(resource)
                     .addSpanProcessor(BatchSpanProcessor.builder(new StatusTrackingExporters.Traces(new MaskingSpanExporter(traceExporter), statusTracker)).setScheduleDelay(exportInterval).build())
+                    .addSpanProcessor(new Owl24DbMetricsSpanProcessor(meterProvider))
                     .build();
 
             openTelemetrySdk = OpenTelemetrySdk.builder()
@@ -378,6 +444,31 @@ public class Owl24 {
             return io.opentelemetry.api.trace.TracerProvider.noop().get("owl24-java");
         }
         return openTelemetrySdk.getTracer("owl24-java");
+    }
+
+    /**
+     * Wraps a JDBC {@link DataSource} so every connection/statement it hands
+     * out is traced, tagged with the {@code db.system}/{@code db.name} OTel
+     * semantic-convention attributes - the Java equivalent of what
+     * getNodeAutoInstrumentations() and owl24-py's psycopg2/pymongo/pymysql/
+     * sqlalchemy instrumentors give those SDKs for free. Java has no
+     * agent-free way to auto-tag JDBC calls the way those do, so a host app
+     * has to opt in explicitly by wrapping its {@code DataSource} bean with
+     * this. Spans produced this way are picked up by
+     * {@link Owl24DbMetricsSpanProcessor} the same as any other
+     * {@code db.system}-tagged span, and reported as
+     * {@code db.query.count}/{@code db.query.duration_ms}/
+     * {@code db.query.error_count}.
+     *
+     * <p>Returns the original {@code dataSource} unwrapped if called before
+     * {@link #init}, consistent with the rest of this SDK degrading to a
+     * no-op instead of taking the host app down.
+     */
+    public static DataSource instrumentDataSource(DataSource dataSource) {
+        if (openTelemetrySdk == null) {
+            return dataSource;
+        }
+        return JdbcTelemetry.create(openTelemetrySdk).wrap(dataSource);
     }
 
     /**
