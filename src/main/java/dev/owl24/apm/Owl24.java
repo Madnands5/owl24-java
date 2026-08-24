@@ -49,11 +49,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Pattern;
 
 public class Owl24 {
     private static OpenTelemetrySdk openTelemetrySdk;
@@ -67,7 +65,24 @@ public class Owl24 {
     // hooks (and a reference to the now-shutdown SDK) alive indefinitely.
     private static List<AutoCloseable> runtimeMetricsHandles = new ArrayList<>();
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final Map<String, Pattern> MASK_PATTERNS = new HashMap<>();
+    // Task H (competitive-roadmap.md) - set once at the end of init()'s core
+    // pipeline setup; trackEvent() below reads this rather than requiring a
+    // separate init-time argument.
+    private static volatile EventIngestConfig eventIngestConfig;
+
+    private static final class EventIngestConfig {
+        final String ingestBaseUrl;
+        final String apiKey;
+        final String userEmail;
+        final String serviceName;
+
+        EventIngestConfig(String ingestBaseUrl, String apiKey, String userEmail, String serviceName) {
+            this.ingestBaseUrl = ingestBaseUrl;
+            this.apiKey = apiKey;
+            this.userEmail = userEmail;
+            this.serviceName = serviceName;
+        }
+    }
 
     // Must run before ORIGINAL_ERR captures System.err below, and before any
     // print statement anywhere in this class - PrintStream's platform
@@ -94,19 +109,30 @@ public class Owl24 {
 
     static {
         objectMapper.configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
-        MASK_PATTERNS.put("email", Pattern.compile("[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"));
-        MASK_PATTERNS.put("creditCard", Pattern.compile("\\b(?:\\d[ -]*?){13,16}\\b"));
-        MASK_PATTERNS.put("phone", Pattern.compile("(\\+?\\d{1,3}[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}"));
-        MASK_PATTERNS.put("bearerToken", Pattern.compile("Bearer\\s+[A-Za-z0-9-_=]+\\.[A-Za-z0-9-_=]+\\.?[A-Za-z0-9-_.+/=]*"));
     }
 
+    // Task 8 (todolist.md), expanded 2026-08-23 - see Masking.java for the
+    // full detection categories (PCI-DSS cards with Luhn validation,
+    // gitleaks-derived secret prefixes, IBAN/MOD-97, US routing numbers, IP
+    // truncation, RFC1918 detection, internal hostname suffixes) and the
+    // customer-configurable field-name mechanism that backs proprietary/
+    // business-sensitive data, which has no pattern of its own. Kept as a
+    // package-private delegate (not removed) since other classes in this
+    // package call it by this name.
     static String maskSensitiveData(String text) {
-        if (text == null) return null;
-        text = MASK_PATTERNS.get("email").matcher(text).replaceAll("[EMAIL_MASKED]");
-        text = MASK_PATTERNS.get("creditCard").matcher(text).replaceAll("[CARD_MASKED]");
-        text = MASK_PATTERNS.get("phone").matcher(text).replaceAll("[PHONE_MASKED]");
-        text = MASK_PATTERNS.get("bearerToken").matcher(text).replaceAll("[TOKEN_MASKED]");
-        return text;
+        return Masking.maskSensitiveData(text);
+    }
+
+    /**
+     * Lets a customer extend (not replace) the default sensitive-field-name
+     * list and the internal-hostname suffix list. maskFields accepts exact
+     * names or '*'-wildcard patterns (e.g. "*api_key*", "pricing.*",
+     * "internal_customer_id"). Call before init(), or any time afterward to
+     * change behavior live - unlike the constructor-style init() overloads,
+     * this doesn't need to grow the parameter list for every new option.
+     */
+    public static void configureMasking(java.util.List<String> maskFields, java.util.List<String> internalHostnameSuffixes) {
+        Masking.configureMasking(maskFields, internalHostnameSuffixes);
     }
 
     static String safeSerialize(Object msg) {
@@ -137,9 +163,21 @@ public class Owl24 {
             this.delegate = delegate;
             AttributesBuilder builder = delegate.getAttributes().toBuilder();
             delegate.getAttributes().forEach((key, value) -> {
-                if (value instanceof String) {
-                    @SuppressWarnings("unchecked")
-                    AttributeKey<String> stringKey = (AttributeKey<String>) key;
+                // Field-name masking only applies to String-typed attributes,
+                // matching the scope value-based masking already had - an
+                // AttributeKey carries its own value type (Long/Double/
+                // Boolean/etc.), and substituting a String value under a
+                // non-String-typed key risks a ClassCastException or a
+                // silently duplicated attribute entry, depending on the
+                // OTel Java Attributes implementation's internal keying. A
+                // non-String field named e.g. "credit_score" is left
+                // untouched - a documented v1 scope limit, not an oversight.
+                if (!(value instanceof String)) return;
+                @SuppressWarnings("unchecked")
+                AttributeKey<String> stringKey = (AttributeKey<String>) key;
+                if (Masking.isSensitiveFieldName(key.getKey())) {
+                    builder.put(stringKey, "[FIELD_MASKED]");
+                } else {
                     builder.put(stringKey, maskSensitiveData((String) value));
                 }
             });
@@ -354,6 +392,7 @@ public class Owl24 {
                     .buildAndRegisterGlobal();
 
             otelLogger = openTelemetrySdk.getSdkLoggerProvider().get("console-bridge");
+            eventIngestConfig = new EventIngestConfig(ingestBaseUrl, resolvedApiKey, userEmail, serviceName != null ? serviceName : "dice-server");
         } catch (Throwable e) {
             // Throwable, not just Exception: a classpath/dependency problem
             // (e.g. NoClassDefFoundError from a missing transitive exporter
@@ -428,6 +467,75 @@ public class Owl24 {
             }));
         } catch (Throwable e) {
             System.err.println("[Owl24] Shutdown hook registration failed: " + e.getMessage());
+        }
+    }
+
+    public static void trackEvent(String name) {
+        trackEvent(name, null);
+    }
+
+    /**
+     * Task H (competitive-roadmap.md) - marks a discrete event (a deploy, a
+     * feature-flag flip, a customer-defined business event) so it shows up
+     * as a marker on the dashboard's time-series charts. Fire-and-forget via
+     * {@code sendAsync} (matching owl24-js's non-awaited fetch) so a slow/
+     * unreachable ingest endpoint never blocks the caller's own request
+     * path. {@code attributes} values are masked the same way span/log
+     * attributes are before they ever leave this process - only String-typed
+     * values go through the value-pattern pass (matching MaskingSpanExporter's
+     * own restriction, since only strings can be pattern-matched), but every
+     * key still goes through the field-NAME check regardless of its value's
+     * type.
+     */
+    public static void trackEvent(String name, Map<String, Object> attributes) {
+        EventIngestConfig config = eventIngestConfig;
+        if (config == null) {
+            System.err.println("[Owl24] trackEvent() called before init().");
+            return;
+        }
+        if (name == null || name.isEmpty()) {
+            System.err.println("[Owl24] trackEvent() requires a non-empty name.");
+            return;
+        }
+
+        Map<String, Object> masked = new java.util.HashMap<>();
+        if (attributes != null) {
+            for (Map.Entry<String, Object> entry : attributes.entrySet()) {
+                Object value = entry.getValue();
+                if (Masking.isSensitiveFieldName(entry.getKey())) {
+                    masked.put(entry.getKey(), "[FIELD_MASKED]");
+                } else if (value instanceof String) {
+                    masked.put(entry.getKey(), Masking.maskSensitiveData((String) value));
+                } else {
+                    masked.put(entry.getKey(), value);
+                }
+            }
+        }
+
+        try {
+            Map<String, Object> body = new java.util.HashMap<>();
+            body.put("name", name);
+            body.put("serviceName", config.serviceName);
+            body.put("attributes", masked);
+            String json = objectMapper.writeValueAsString(body);
+
+            HttpClient client = HttpClient.newHttpClient();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(config.ingestBaseUrl + "/v1/events"))
+                    .header("x-api-key", config.apiKey)
+                    .header("x-user-email", config.userEmail)
+                    .header("x-sdk-language", "java")
+                    .header("x-sdk-version", SDK_VERSION)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                    .build();
+            client.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                    .exceptionally(e -> {
+                        System.err.println("[Owl24] trackEvent() failed: " + e.getMessage());
+                        return null;
+                    });
+        } catch (Exception e) {
+            System.err.println("[Owl24] trackEvent() failed: " + e.getMessage());
         }
     }
 

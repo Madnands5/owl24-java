@@ -177,6 +177,18 @@
             <artifactId>micrometer-tracing-bridge-otel</artifactId>
             <version>1.3.5</version>
         </dependency>
+
+        <!--
+          Task 12 (todolist.md, added 2026-08-23) - no test dependencies or
+          Surefire were configured at all before this. Test-scoped, so a
+          consumer of the published owl24-java artifact never pulls this in.
+        -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.3</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <distributionManagement>
@@ -188,6 +200,39 @@
 
     <build>
         <plugins>
+            <!--
+              Task 12 (todolist.md, added 2026-08-23) - explicit version
+              pin since this pom has no parent managing plugin versions;
+              `mvn test` was previously a no-op (no test dependencies, no
+              Surefire config at all).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+            </plugin>
+
+            <!-- Coverage reporting (Task 12) - `mvn test jacoco:report`, output in target/site/jacoco/. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.12</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
             <!--
               Central Portal publishing (replaces the old OSSRH/nexus-staging
               flow, which Sonatype sunset - any namespace registered now goes
