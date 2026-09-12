@@ -269,7 +269,15 @@ public class Owl24 {
     }
 
     public static void init(String apiKey, String serviceName) {
-        init(apiKey, serviceName, 3000, false);
+        // 10s (was 3s): a deliberate compromise batching window - long
+        // enough to meaningfully cut ingest request volume/cost, short
+        // enough to not badly degrade alerting/dashboard freshness (30s was
+        // considered and rejected as too slow for this product's
+        // "solve incidents fast" positioning). Shared by traces/logs AND
+        // metrics, since this SDK has a single exportInterval, not a
+        // separate metrics-only one (unlike the Python sibling) - an
+        // accepted existing coupling, not something this change fixes.
+        init(apiKey, serviceName, 10000, false);
     }
 
     public static void init(String apiKey, String serviceName, long exportIntervalMillis, boolean disableConsoleBridge) {
@@ -278,6 +286,19 @@ public class Owl24 {
 
     public static void init(String apiKey, String serviceName, long exportIntervalMillis, boolean disableConsoleBridge,
                              boolean disableCrashCapture, long exportTimeoutMillis) {
+        init(apiKey, serviceName, exportIntervalMillis, disableConsoleBridge, disableCrashCapture, exportTimeoutMillis, null);
+    }
+
+    /**
+     * Most general overload: also accepts an ingest base URL override, for
+     * self-hosted customers pointing this SDK at their own collector
+     * instead of owl24's hosted ingest endpoint. Pass {@code null} (or an
+     * empty string) to keep the hosted default - every shorter overload
+     * above delegates down to this one that way, so their behavior is
+     * unchanged.
+     */
+    public static void init(String apiKey, String serviceName, long exportIntervalMillis, boolean disableConsoleBridge,
+                             boolean disableCrashCapture, long exportTimeoutMillis, String ingestBaseUrlOverride) {
         String resolvedApiKey = (apiKey != null) ? apiKey : System.getenv("owl24_API_KEY");
         if (resolvedApiKey == null) resolvedApiKey = System.getenv("OBSERVE_API_KEY");
 
@@ -285,11 +306,12 @@ public class Owl24 {
         if (userEmail == null) userEmail = System.getenv("OBSERVE_USER_EMAIL");
         if (userEmail == null) userEmail = "unknown@local.dev";
 
-        // Hardcoded, not configurable: owl24 is a fully-hosted service with
-        // one fixed ingest endpoint - unlike the API key (per-customer) or
-        // user email, there's nothing for a caller to legitimately point
-        // this at instead.
-        String ingestBaseUrl = "https://ingest.owl24.dev";
+        // Defaults to owl24's hosted ingest endpoint, same as
+        // owl24-web's ingestBaseUrl option - overridable via
+        // ingestBaseUrlOverride for self-hosted customers running their own
+        // collector.
+        String ingestBaseUrl = (ingestBaseUrlOverride != null && !ingestBaseUrlOverride.isEmpty())
+                ? ingestBaseUrlOverride : "https://ingest.owl24.dev";
 
         if (resolvedApiKey == null) {
             System.err.println("[Owl24] API Key required.");
@@ -342,6 +364,7 @@ public class Owl24 {
                     .addHeader("x-sdk-language", "java")
                     .addHeader("x-sdk-version", SDK_VERSION)
                     .setTimeout(exportTimeout)
+                    .setCompression("gzip")
                     .build();
 
             OtlpHttpMetricExporter metricExporter = OtlpHttpMetricExporter.builder()
@@ -351,6 +374,7 @@ public class Owl24 {
                     .addHeader("x-sdk-language", "java")
                     .addHeader("x-sdk-version", SDK_VERSION)
                     .setTimeout(exportTimeout)
+                    .setCompression("gzip")
                     .build();
 
             OtlpHttpLogRecordExporter logExporter = OtlpHttpLogRecordExporter.builder()
@@ -360,6 +384,7 @@ public class Owl24 {
                     .addHeader("x-sdk-language", "java")
                     .addHeader("x-sdk-version", SDK_VERSION)
                     .setTimeout(exportTimeout)
+                    .setCompression("gzip")
                     .build();
 
             // Tracks whether each of traces/metrics/logs is actually getting
@@ -371,7 +396,11 @@ public class Owl24 {
 
             SdkLoggerProvider loggerProvider = SdkLoggerProvider.builder()
                     .setResource(resource)
-                    .addLogRecordProcessor(BatchLogRecordProcessor.builder(new StatusTrackingExporters.Logs(logExporter, statusTracker)).setScheduleDelay(exportInterval).build())
+                    .addLogRecordProcessor(BatchLogRecordProcessor.builder(new StatusTrackingExporters.Logs(logExporter, statusTracker))
+                            .setScheduleDelay(exportInterval)
+                            .setMaxExportBatchSize(2048)
+                            .setMaxQueueSize(8192)
+                            .build())
                     .build();
 
             SdkMeterProvider meterProvider = SdkMeterProvider.builder()
@@ -381,7 +410,11 @@ public class Owl24 {
 
             SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
                     .setResource(resource)
-                    .addSpanProcessor(BatchSpanProcessor.builder(new StatusTrackingExporters.Traces(new MaskingSpanExporter(traceExporter), statusTracker)).setScheduleDelay(exportInterval).build())
+                    .addSpanProcessor(BatchSpanProcessor.builder(new StatusTrackingExporters.Traces(new MaskingSpanExporter(traceExporter), statusTracker))
+                            .setScheduleDelay(exportInterval)
+                            .setMaxExportBatchSize(2048)
+                            .setMaxQueueSize(8192)
+                            .build())
                     .addSpanProcessor(new Owl24DbMetricsSpanProcessor(meterProvider))
                     .build();
 
@@ -393,6 +426,37 @@ public class Owl24 {
 
             otelLogger = openTelemetrySdk.getSdkLoggerProvider().get("console-bridge");
             eventIngestConfig = new EventIngestConfig(ingestBaseUrl, resolvedApiKey, userEmail, serviceName != null ? serviceName : "dice-server");
+
+            // Startup jitter: a one-time, non-blocking forceFlush() at a
+            // random point in [0, 10s) after init() has already finished
+            // building/registering everything synchronously (spans must
+            // still be capturable from t=0 - this must never delay that,
+            // since doing so would be a real regression for k8s readiness
+            // probes / fast-starting hosts). This only smooths out the
+            // very first export's timing across many instances starting at
+            // once (e.g. a fleet rollout); it never delays init() itself.
+            // delayedExecutor requires Java 9+; this package targets 17
+            // (see pom.xml), so it's safe here. Best-effort: any failure is
+            // swallowed, never thrown back into the host app.
+            try {
+                long jitterMillis = java.util.concurrent.ThreadLocalRandom.current().nextLong(10000);
+                SdkTracerProvider jitterTracerProvider = tracerProvider;
+                SdkLoggerProvider jitterLoggerProvider = loggerProvider;
+                java.util.concurrent.CompletableFuture
+                        .delayedExecutor(jitterMillis, TimeUnit.MILLISECONDS)
+                        .execute(() -> {
+                            try {
+                                jitterTracerProvider.forceFlush();
+                                jitterLoggerProvider.forceFlush();
+                            } catch (Throwable flushError) {
+                                // Best-effort only - never let a failure here
+                                // surface anywhere the host app would notice.
+                            }
+                        });
+            } catch (Throwable e) {
+                // Scheduling itself failed (e.g. rejected execution) -
+                // degrade to no jitter rather than affect startup.
+            }
         } catch (Throwable e) {
             // Throwable, not just Exception: a classpath/dependency problem
             // (e.g. NoClassDefFoundError from a missing transitive exporter
