@@ -4,7 +4,7 @@
 
     <groupId>dev.owl24.apm</groupId>
     <artifactId>owl24-java</artifactId>
-    <version>0.1.6</version>
+    <version>0.1.7</version>
     <packaging>jar</packaging>
 
     <name>owl24-java</name>

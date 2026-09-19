@@ -10,7 +10,7 @@ Maven:
 <dependency>
     <groupId>dev.owl24.apm</groupId>
     <artifactId>owl24-java</artifactId>
-    <version>0.1.2</version>
+    <version>0.1.7</version>
 </dependency>
 ```
 
