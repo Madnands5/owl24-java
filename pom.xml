@@ -14,7 +14,7 @@
     <licenses>
         <license>
             <name>MIT License</name>
-            <url>https://github.com/Madnands5/owl24/blob/main/packages/owl24-java/LICENSE</url>
+            <url>https://github.com/Madnands5/owl24-java/blob/main/LICENSE</url>
         </license>
     </licenses>
 
@@ -26,9 +26,9 @@
     </developers>
 
     <scm>
-        <connection>scm:git:https://github.com/Madnands5/owl24.git</connection>
-        <developerConnection>scm:git:https://github.com/Madnands5/owl24.git</developerConnection>
-        <url>https://github.com/Madnands5/owl24</url>
+        <connection>scm:git:https://github.com/Madnands5/owl24-java.git</connection>
+        <developerConnection>scm:git:https://github.com/Madnands5/owl24-java.git</developerConnection>
+        <url>https://github.com/Madnands5/owl24-java</url>
         <tag>HEAD</tag>
     </scm>
 

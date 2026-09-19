@@ -106,6 +106,10 @@ All log lines are plain text, no icons: `[Owl24] ...`.
 
 This status tracking is entirely local — nothing is reported back to owl24's backend, it's just clearer logging in your own process/console.
 
+## Working with your coding agent
+
+Errors ingested via this SDK can be deduplicated and handed straight to your own coding agent - claim, investigate, fix, PR. Reach that queue interactively from Claude Code or Cursor with [owl24-mcp](https://github.com/Madnands5/owl24-mcp), or unattended via REST + AGENTS.md (see the [docs](https://owl24.dev/docs#agent-integration)).
+
 ## License
 
-MIT — see [LICENSE](https://github.com/Madnands5/owl24/blob/main/packages/owl24-java/LICENSE).
+MIT — see [LICENSE](https://github.com/Madnands5/owl24-java/blob/main/LICENSE).
