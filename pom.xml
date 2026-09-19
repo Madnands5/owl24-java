@@ -4,11 +4,11 @@
 
     <groupId>dev.owl24.apm</groupId>
     <artifactId>owl24-java</artifactId>
-    <version>0.1.5</version>
+    <version>0.1.6</version>
     <packaging>jar</packaging>
 
     <name>owl24-java</name>
-    <description>Java SDK for owl24 - one line of code to send logs, traces, and metrics to your owl24 dashboard, built on OpenTelemetry.</description>
+    <description>Java SDK for owl24 - one line of code to send logs, traces, and metrics to your owl24 dashboard, built on OpenTelemetry, with errors queued straight to your own coding agent to fix and PR.</description>
     <url>https://owl24.dev</url>
 
     <licenses>

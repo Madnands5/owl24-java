@@ -31,8 +31,17 @@ import io.opentelemetry.sdk.trace.SpanProcessor;
  */
 final class Owl24DbMetricsSpanProcessor implements SpanProcessor {
 
+    // Both OpenTelemetry semantic-convention eras. semconv 1.x renamed
+    // db.system -> db.system.name and db.name -> db.namespace, and current
+    // instrumentation emits only the new spellings. Reading just the old names
+    // made this processor return early on every database span, so
+    // db.query.count/duration/error_count were never emitted at all and the
+    // dashboard's Database page stayed blank with nothing to explain it.
+    // Confirmed live in owl24-js on 2026-09-19; same bug, same fix here.
     private static final AttributeKey<String> DB_SYSTEM = AttributeKey.stringKey("db.system");
+    private static final AttributeKey<String> DB_SYSTEM_NAME = AttributeKey.stringKey("db.system.name");
     private static final AttributeKey<String> DB_NAME = AttributeKey.stringKey("db.name");
+    private static final AttributeKey<String> DB_NAMESPACE = AttributeKey.stringKey("db.namespace");
 
     private final LongCounter queryCount;
     private final DoubleHistogram queryDuration;
@@ -63,13 +72,23 @@ final class Owl24DbMetricsSpanProcessor implements SpanProcessor {
 
     @Override
     public void onEnd(ReadableSpan span) {
-        String dbSystem = span.getAttribute(DB_SYSTEM);
+        // 1.x name wins when both are present - an SDK emitting both is
+        // mid-migration and the newer value is the authoritative one.
+        String dbSystem = span.getAttribute(DB_SYSTEM_NAME);
+        if (dbSystem == null) {
+            dbSystem = span.getAttribute(DB_SYSTEM);
+        }
         if (dbSystem == null) {
             return;
         }
 
+        // Reported under the old key so the dashboard's grouping keeps working
+        // regardless of which convention the span arrived in.
         AttributesBuilder attributesBuilder = Attributes.builder().put(DB_SYSTEM, dbSystem);
-        String dbName = span.getAttribute(DB_NAME);
+        String dbName = span.getAttribute(DB_NAMESPACE);
+        if (dbName == null) {
+            dbName = span.getAttribute(DB_NAME);
+        }
         if (dbName != null) {
             attributesBuilder.put(DB_NAME, dbName);
         }

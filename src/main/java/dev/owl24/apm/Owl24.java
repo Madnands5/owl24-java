@@ -41,6 +41,13 @@ import javax.sql.DataSource;
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogManager;
+import java.util.logging.LogRecord;
+import java.util.logging.SimpleFormatter;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -477,6 +484,7 @@ public class Owl24 {
         if (!disableConsoleBridge) {
             try {
                 setupConsoleBridge();
+                setupJulBridge();
             } catch (Throwable e) {
                 // Bridge may be half-installed here, so use ORIGINAL_ERR
                 // rather than risk this message routing through a
@@ -775,6 +783,79 @@ public class Owl24 {
                 emitLog(String.format(format, args), "ERROR", Severity.ERROR);
                 return this;
             }
+        });
+    }
+
+    /**
+     * Captures java.util.logging output.
+     *
+     * Added 2026-09-19 after running clientservers/java-server against a local
+     * collector: the System.out/System.err bridge above misses JUL entirely,
+     * because java.util.logging's ConsoleHandler grabs a direct reference to
+     * System.err when it is constructed - which happens on first logger use,
+     * typically at class-load of a class holding a static Logger, i.e. BEFORE
+     * Owl24.init() ever runs. Replacing System.err afterwards cannot affect a
+     * handler that already captured the original stream.
+     *
+     * The practical effect was that {@code LOGGER.log(Level.SEVERE, "...", e)}
+     * - the ordinary way Java code reports an error - produced nothing at all
+     * in the dashboard, while a bare System.out.println was captured fine.
+     * Since almost no real Java service logs via System.out, error logs and
+     * their stack traces were effectively invisible for Java customers.
+     *
+     * Attaching a Handler to the root logger sidesteps stream interception
+     * completely, and mirrors what owl24-py already does with Python's
+     * logging module.
+     */
+    private static void setupJulBridge() {
+        java.util.logging.Logger root = LogManager.getLogManager().getLogger("");
+        if (root == null) {
+            return;
+        }
+        // Formatter.formatMessage resolves the record's message and any
+        // {0}-style parameters. Handler itself has no such method, and
+        // record.getMessage() alone would leave placeholders unsubstituted.
+        final SimpleFormatter formatter = new SimpleFormatter();
+        root.addHandler(new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record == null || !isLoggable(record)) {
+                    return;
+                }
+                // Never bridge our own output - emitLog failures log via
+                // System.err, which would otherwise loop straight back here.
+                String loggerName = record.getLoggerName();
+                if (loggerName != null && loggerName.startsWith("dev.owl24")) {
+                    return;
+                }
+                try {
+                    StringBuilder body = new StringBuilder();
+                    body.append(formatter.formatMessage(record));
+
+                    // The throwable is the whole point: without it an error log
+                    // is one line of prose and the stack trace - the single most
+                    // useful artifact for root-cause analysis - is discarded.
+                    Throwable thrown = record.getThrown();
+                    if (thrown != null) {
+                        StringWriter sw = new StringWriter();
+                        thrown.printStackTrace(new PrintWriter(sw));
+                        body.append(System.lineSeparator()).append(sw);
+                    }
+
+                    boolean isError = record.getLevel().intValue() >= Level.WARNING.intValue();
+                    emitLog(body.toString(),
+                            isError ? "ERROR" : "INFO",
+                            isError ? Severity.ERROR : Severity.INFO);
+                } catch (Throwable ignored) {
+                    // A logging bridge must never break the caller's request.
+                }
+            }
+
+            @Override
+            public void flush() { }
+
+            @Override
+            public void close() { }
         });
     }
 
